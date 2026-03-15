@@ -2,7 +2,6 @@ import asyncio
 import os
 import io
 import json
-import base64
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -12,7 +11,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from telegram import Update
+from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -77,17 +76,20 @@ DB_URL = os.getenv("DB_URL")
 engine = create_engine(DB_URL) if DB_URL else None
 
 # --- Conversation states ---
-WAITING_PHOTOS, WAITING_DESCRIPTION = range(2)
+WAITING_PHOTOS, WAITING_DESCRIPTION, BATCH_COLLECTING = range(3)
 
 
-def build_prompt(description: str, example_captions: list[str]) -> str:
+def build_prompt(example_captions: list[str], description: str | None = None) -> str:
     examples_block = "\n".join(
         f"  {i+1}) {cap}" for i, cap in enumerate(example_captions)
     )
+    if description:
+        desc_line = f'The seller has sent you photos of a clothing item along with this description:\n"{description}"'
+    else:
+        desc_line = "The seller has sent you photos of a clothing item. Describe what you see and write a caption for it."
     return f"""You are a caption writer for an online clothing store on social media.
 
-The seller has sent you photos of a clothing item along with this description:
-"{description}"
+{desc_line}
 
 Here are example captions written by the seller — match this exact tone, energy, and emoji style:
 {examples_block}
@@ -99,6 +101,7 @@ Rules:
 - Keep it short (1-3 sentences max).
 - Use relevant emojis liberally, matching the vibe of the examples.
 - Do NOT add hashtags unless the examples use them.
+- Do NOT include measurements or sizing unless given in the description.
 - Output ONLY the caption text, nothing else."""
 
 
@@ -133,6 +136,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "then I'll ask for a quick description and generate a caption for you.\n\n"
             "Commands:\n"
             "/start - Start over\n"
+            "/batch - Batch mode (send multiple items, then /done)\n"
             "/addcaption <text> - Add an example caption\n"
             "/listcaptions - List saved example captions\n"
             "/cancel - Cancel current item"
@@ -196,6 +200,43 @@ async def photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_DESCRIPTION
 
 
+async def generate_and_send(chat_id: int, bot, photos: list[bytes],
+                           example_captions: list[str],
+                           description: str | None = None) -> str | None:
+    """Generate a caption for photos and send them back as a forwardable media group.
+    Returns the caption on success, or None on failure."""
+    prompt = build_prompt(example_captions, description)
+
+    parts = []
+    for photo_bytes in photos:
+        parts.append(types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg"))
+    parts.append(types.Part.from_text(text=prompt))
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[types.Content(parts=parts, role="user")],
+        )
+        caption = response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        await bot.send_message(chat_id=chat_id,
+                               text=f"Sorry, something went wrong generating the caption. Error: {e}")
+        return None
+
+    # Send photos back with caption as a forwardable media group
+    media = []
+    for i, photo_bytes in enumerate(photos):
+        buf = io.BytesIO(photo_bytes)
+        buf.name = f"photo_{i}.jpg"
+        if i == 0:
+            media.append(InputMediaPhoto(media=buf, caption=caption))
+        else:
+            media.append(InputMediaPhoto(media=buf))
+    await bot.send_media_group(chat_id=chat_id, media=media)
+    return caption
+
+
 async def description_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User sent a text description — generate the caption."""
     photos = context.user_data.get("photos", [])
@@ -209,28 +250,100 @@ async def description_received(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("✨ Generating your caption...")
 
     example_captions = load_example_captions()
-    prompt = build_prompt(description, example_captions)
+    await generate_and_send(update.effective_chat.id, context.bot, photos,
+                            example_captions, description)
 
-    # Build Gemini content parts: photos + text prompt
-    parts = []
-    for photo_bytes in photos:
-        b64 = base64.b64encode(photo_bytes).decode()
-        parts.append(types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg"))
-    parts.append(types.Part.from_text(text=prompt))
+    context.user_data.clear()
+    return ConversationHandler.END
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[types.Content(parts=parts, role="user")],
+
+# =====================================================================
+# Batch mode handlers
+# =====================================================================
+
+async def batch_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enter batch mode — collect multiple clothing items."""
+    context.user_data.clear()
+    context.user_data["batch_items"] = []       # list of lists of photo bytes
+    context.user_data["batch_group_map"] = {}   # media_group_id -> index
+    context.user_data["pending_batch_groups"] = {}
+    await update.message.reply_text(
+        "📦 Batch mode! Send all your clothing photos — each item as an album "
+        "(2-4 pics per item).\n\nWhen you're done, send /done to generate captions."
+    )
+    return BATCH_COLLECTING
+
+
+async def _batch_group_ack(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group_id: str):
+    """Delayed acknowledgment for a batch media group."""
+    await asyncio.sleep(MEDIA_GROUP_WAIT)
+    user_data = context.application.user_data.get(chat_id, {})
+    items = user_data.get("batch_items", [])
+    group_map = user_data.get("batch_group_map", {})
+    idx = group_map.get(media_group_id)
+    if idx is not None:
+        count = len(items[idx])
+        total_items = len(items)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"📸 Item #{total_items} — got {count} photo{'s' if count != 1 else ''}. "
+            f"Send more items or /done to generate.",
         )
-        caption = response.text.strip()
-        await update.message.reply_text(f"📝 Here's your caption:\n\n{caption}")
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
+
+
+async def batch_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect photos in batch mode, grouping by media_group_id."""
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    buf = io.BytesIO()
+    await file.download_to_memory(buf)
+    buf.seek(0)
+    photo_bytes = buf.read()
+
+    items = context.user_data["batch_items"]
+    group_map = context.user_data["batch_group_map"]
+    media_group_id = update.message.media_group_id
+
+    if media_group_id:
+        if media_group_id not in group_map:
+            group_map[media_group_id] = len(items)
+            items.append([])
+        items[group_map[media_group_id]].append(photo_bytes)
+
+        # Debounced ack — one per album
+        pending = context.user_data["pending_batch_groups"]
+        pending[media_group_id] = pending.get(media_group_id, 0) + 1
+        if pending[media_group_id] == 1:
+            asyncio.create_task(
+                _batch_group_ack(context, update.effective_chat.id, media_group_id)
+            )
+    else:
+        # Single photo = its own item
+        items.append([photo_bytes])
         await update.message.reply_text(
-            f"Sorry, something went wrong generating the caption. Error: {e}"
+            f"📸 Item #{len(items)} — got 1 photo. Send more items or /done to generate."
         )
 
+    return BATCH_COLLECTING
+
+
+async def batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process all collected items one by one."""
+    items = context.user_data.get("batch_items", [])
+    if not items:
+        await update.message.reply_text("No photos received yet! Send some albums first.")
+        return BATCH_COLLECTING
+
+    total = len(items)
+    await update.message.reply_text(f"⏳ Generating captions for {total} item{'s' if total != 1 else ''}...")
+
+    example_captions = load_example_captions()
+
+    for i, photos in enumerate(items):
+        await update.message.reply_text(f"✨ Processing item {i + 1}/{total}...")
+        await generate_and_send(update.effective_chat.id, context.bot, photos, example_captions)
+
+    await update.message.reply_text(f"✅ All {total} items done!")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -432,6 +545,7 @@ def main():
     # Caption generation conversation (private chats only)
     conv_handler = ConversationHandler(
         entry_points=[
+            CommandHandler("batch", batch_start),
             MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_received),
         ],
         states={
@@ -441,6 +555,10 @@ def main():
             WAITING_DESCRIPTION: [
                 MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, description_received),
+            ],
+            BATCH_COLLECTING: [
+                MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, batch_photo_received),
+                CommandHandler("done", batch_done),
             ],
         },
         fallbacks=[
