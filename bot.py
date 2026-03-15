@@ -76,7 +76,7 @@ DB_URL = os.getenv("DB_URL")
 engine = create_engine(DB_URL) if DB_URL else None
 
 # --- Conversation states ---
-WAITING_PHOTOS, WAITING_DESCRIPTION, BATCH_COLLECTING = range(3)
+BATCH_COLLECTING = 0
 
 
 def build_prompt(example_captions: list[str], description: str | None = None) -> str:
@@ -102,6 +102,7 @@ Rules:
 - Use relevant emojis liberally, matching the vibe of the examples.
 - Do NOT add hashtags unless the examples use them.
 - Do NOT include measurements or sizing unless given in the description.
+- End with a price line in the format "SB: $X" (X is a whole number). If no price is given in the description, default to $3. There must be an empty line before the "SB:" line.
 - Output ONLY the caption text, nothing else."""
 
 
@@ -132,41 +133,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # Caption bot: show help
         await update.message.reply_text(
-            "Hey! 👋 Send me photos of your clothing item (2-4 pics), "
-            "then I'll ask for a quick description and generate a caption for you.\n\n"
+            "Hey! 👋 Send me an album of photos (2-4 pics) with a description "
+            "in the caption and I'll generate a caption for you.\n\n"
             "Commands:\n"
-            "/start - Start over\n"
+            "/start - Show this help\n"
             "/batch - Batch mode (send multiple items, then /done)\n"
             "/addcaption <text> - Add an example caption\n"
             "/listcaptions - List saved example captions\n"
-            "/cancel - Cancel current item"
+            "/cancel - Cancel current batch"
         )
         context.user_data.clear()
 
     return ConversationHandler.END
 
 
-async def _finalize_media_group(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group_id: str):
-    """Called after a delay to send a single reply for the entire media group."""
+async def _finalize_single_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int, media_group_id: str):
+    """Called after a delay once all photos in the album have arrived. Generates caption and sends."""
     await asyncio.sleep(MEDIA_GROUP_WAIT)
     user_data = context.application.user_data.get(chat_id, {})
-    pending = user_data.get("pending_media_groups", {})
-    count = pending.pop(media_group_id, 0)
-    total = len(user_data.get("photos", []))
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"📸 Got {total} photo{'s' if total != 1 else ''}! "
-        f"Send more photos, or type a description of the item "
-        f"(e.g. 'white Nike hoodie, size M') to generate a caption.",
-    )
+    photos = user_data.pop("photos", [])
+    description = user_data.pop("description", None)
+
+    if not photos:
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text="✨ Generating your caption...")
+    example_captions = load_example_captions()
+    await generate_and_send(chat_id, context.bot, photos, example_captions, description)
 
 
 async def photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Collect photos. Batches media groups so only one reply is sent per album."""
+    """Collect photos from an album, capture the caption, then auto-generate."""
     if "photos" not in context.user_data:
         context.user_data["photos"] = []
-    if "pending_media_groups" not in context.user_data:
-        context.user_data["pending_media_groups"] = {}
 
     # Get the highest resolution version of the photo
     photo = update.message.photo[-1]
@@ -174,30 +173,28 @@ async def photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buf = io.BytesIO()
     await file.download_to_memory(buf)
     buf.seek(0)
-    photo_bytes = buf.read()
-    context.user_data["photos"].append(photo_bytes)
+    context.user_data["photos"].append(buf.read())
+
+    # Capture the caption/description from the album message
+    if update.message.caption:
+        context.user_data["description"] = update.message.caption
 
     media_group_id = update.message.media_group_id
 
     if media_group_id:
-        # Part of an album — only schedule one reply per group
-        pending = context.user_data["pending_media_groups"]
-        pending[media_group_id] = pending.get(media_group_id, 0) + 1
-        if pending[media_group_id] == 1:
-            # First photo in this group — schedule a delayed reply
+        # Part of an album — schedule generation after all photos arrive
+        if "pending_group" not in context.user_data:
+            context.user_data["pending_group"] = media_group_id
             asyncio.create_task(
-                _finalize_media_group(context, update.effective_chat.id, media_group_id)
+                _finalize_single_item(context, update.effective_chat.id, media_group_id)
             )
     else:
-        # Single photo (not an album)
-        count = len(context.user_data["photos"])
-        await update.message.reply_text(
-            f"📸 Got {count} photo{'s' if count != 1 else ''}! "
-            f"Send more photos, or type a description of the item "
-            f"(e.g. 'white Nike hoodie, size M') to generate a caption."
-        )
-
-    return WAITING_DESCRIPTION
+        # Single photo — generate immediately
+        photos = context.user_data.pop("photos", [])
+        description = context.user_data.pop("description", None)
+        await update.message.reply_text("✨ Generating your caption...")
+        example_captions = load_example_captions()
+        await generate_and_send(update.effective_chat.id, context.bot, photos, example_captions, description)
 
 
 async def generate_and_send(chat_id: int, bot, photos: list[bytes],
@@ -237,26 +234,6 @@ async def generate_and_send(chat_id: int, bot, photos: list[bytes],
     return caption
 
 
-async def description_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User sent a text description — generate the caption."""
-    photos = context.user_data.get("photos", [])
-    if not photos:
-        await update.message.reply_text(
-            "Please send at least one photo first! 📷"
-        )
-        return WAITING_PHOTOS
-
-    description = update.message.text
-    await update.message.reply_text("✨ Generating your caption...")
-
-    example_captions = load_example_captions()
-    await generate_and_send(update.effective_chat.id, context.bot, photos,
-                            example_captions, description)
-
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
 # =====================================================================
 # Batch mode handlers
 # =====================================================================
@@ -264,12 +241,13 @@ async def description_received(update: Update, context: ContextTypes.DEFAULT_TYP
 async def batch_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Enter batch mode — collect multiple clothing items."""
     context.user_data.clear()
-    context.user_data["batch_items"] = []       # list of lists of photo bytes
-    context.user_data["batch_group_map"] = {}   # media_group_id -> index
+    context.user_data["batch_items"] = []         # list of {"photos": [...], "description": ...}
+    context.user_data["batch_group_map"] = {}     # media_group_id -> index
     context.user_data["pending_batch_groups"] = {}
     await update.message.reply_text(
-        "📦 Batch mode! Send all your clothing photos — each item as an album "
-        "(2-4 pics per item).\n\nWhen you're done, send /done to generate captions."
+        "📦 Batch mode! Send your clothing items as albums "
+        "(2-4 pics per item, with a description in the caption).\n\n"
+        "When you're done, send /done to generate captions."
     )
     return BATCH_COLLECTING
 
@@ -282,7 +260,7 @@ async def _batch_group_ack(context: ContextTypes.DEFAULT_TYPE, chat_id: int, med
     group_map = user_data.get("batch_group_map", {})
     idx = group_map.get(media_group_id)
     if idx is not None:
-        count = len(items[idx])
+        count = len(items[idx]["photos"])
         total_items = len(items)
         await context.bot.send_message(
             chat_id=chat_id,
@@ -307,8 +285,11 @@ async def batch_photo_received(update: Update, context: ContextTypes.DEFAULT_TYP
     if media_group_id:
         if media_group_id not in group_map:
             group_map[media_group_id] = len(items)
-            items.append([])
-        items[group_map[media_group_id]].append(photo_bytes)
+            items.append({"photos": [], "description": None})
+        item = items[group_map[media_group_id]]
+        item["photos"].append(photo_bytes)
+        if update.message.caption:
+            item["description"] = update.message.caption
 
         # Debounced ack — one per album
         pending = context.user_data["pending_batch_groups"]
@@ -319,7 +300,7 @@ async def batch_photo_received(update: Update, context: ContextTypes.DEFAULT_TYP
             )
     else:
         # Single photo = its own item
-        items.append([photo_bytes])
+        items.append({"photos": [photo_bytes], "description": update.message.caption})
         await update.message.reply_text(
             f"📸 Item #{len(items)} — got 1 photo. Send more items or /done to generate."
         )
@@ -339,9 +320,10 @@ async def batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     example_captions = load_example_captions()
 
-    for i, photos in enumerate(items):
+    for i, item in enumerate(items):
         await update.message.reply_text(f"✨ Processing item {i + 1}/{total}...")
-        await generate_and_send(update.effective_chat.id, context.bot, photos, example_captions)
+        await generate_and_send(update.effective_chat.id, context.bot,
+                                item["photos"], example_captions, item["description"])
 
     await update.message.reply_text(f"✅ All {total} items done!")
     context.user_data.clear()
@@ -542,20 +524,12 @@ def main():
     app.add_handler(CommandHandler("listcaptions", list_captions))
     app.add_handler(CommandHandler("deleted", show_deleted))
 
-    # Caption generation conversation (private chats only)
-    conv_handler = ConversationHandler(
+    # Batch mode conversation (private chats only)
+    batch_conv = ConversationHandler(
         entry_points=[
             CommandHandler("batch", batch_start),
-            MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_received),
         ],
         states={
-            WAITING_PHOTOS: [
-                MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_received),
-            ],
-            WAITING_DESCRIPTION: [
-                MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_received),
-                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, description_received),
-            ],
             BATCH_COLLECTING: [
                 MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, batch_photo_received),
                 CommandHandler("done", batch_done),
@@ -566,7 +540,10 @@ def main():
             CommandHandler("start", start),
         ],
     )
-    app.add_handler(conv_handler)
+    app.add_handler(batch_conv)
+
+    # Single-item caption generation (private chats only)
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, photo_received))
 
     # Delete tracker (group chats only)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, handle_message))
