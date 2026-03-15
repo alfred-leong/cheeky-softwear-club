@@ -2,6 +2,7 @@ import asyncio
 import os
 import io
 import json
+import base64
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -9,8 +10,7 @@ from pathlib import Path
 from datetime import datetime
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import Groq
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     Application,
@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # --- Example captions (edit this list to refine the style) ---
 EXAMPLE_CAPTIONS_FILE = Path(__file__).parent / "captions.json"
@@ -67,9 +67,9 @@ if not EXAMPLE_CAPTIONS_FILE.exists():
         ]
     )
 
-# --- Gemini client ---
-gemini_client = genai.Client(api_key=GOOGLE_API_KEY)
-GEMINI_MODEL = "gemini-2.5-flash"
+# --- Groq client ---
+groq_client = Groq(api_key=GROQ_API_KEY)
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # --- Database (for delete tracker) ---
 DB_URL = os.getenv("DB_URL")
@@ -204,19 +204,24 @@ async def generate_and_send(chat_id: int, bot, photos: list[bytes],
     Returns the caption on success, or None on failure."""
     prompt = build_prompt(example_captions, description)
 
-    parts = []
+    # Build message content: images (base64) + text prompt
+    content = []
     for photo_bytes in photos:
-        parts.append(types.Part.from_bytes(data=photo_bytes, mime_type="image/jpeg"))
-    parts.append(types.Part.from_text(text=prompt))
+        b64 = base64.b64encode(photo_bytes).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        })
+    content.append({"type": "text", "text": prompt})
 
     try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[types.Content(parts=parts, role="user")],
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": content}],
         )
-        caption = response.text.strip()
+        caption = response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
+        logger.error(f"Groq error: {e}")
         await bot.send_message(chat_id=chat_id,
                                text=f"Sorry, something went wrong generating the caption. Error: {e}")
         return None

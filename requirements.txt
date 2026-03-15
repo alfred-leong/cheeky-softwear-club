@@ -1,5 +1,5 @@
 python-telegram-bot==21.6
-google-genai==1.14.0
+groq==0.25.0
 python-dotenv==1.1.0
 apscheduler==3.10.4
 psycopg2-binary==2.9.9
