@@ -4,6 +4,8 @@ import io
 import json
 import base64
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
 
@@ -401,7 +403,24 @@ async def post_init(application: Application):
         logger.info("Scheduler started - DB cleanup at 12 PM SGT daily")
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info(f"Health server listening on port {port}")
+
+
 def main():
+    start_health_server()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     # Commands

@@ -1,8 +1,8 @@
 services:
-  - type: worker
+  - type: web
     name: cheeky-caption-bot
     runtime: docker
-    plan: starter
+    plan: free
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
