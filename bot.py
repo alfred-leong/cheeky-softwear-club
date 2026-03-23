@@ -1,12 +1,10 @@
 import asyncio
 import os
 import io
-import json
 import base64
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -40,41 +38,63 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# --- Example captions (edit this list to refine the style) ---
-EXAMPLE_CAPTIONS_FILE = Path(__file__).parent / "captions.json"
+# --- Example captions (stored in DB for persistence across deploys) ---
 
-
-def load_example_captions() -> list[str]:
-    if EXAMPLE_CAPTIONS_FILE.exists():
-        return json.loads(EXAMPLE_CAPTIONS_FILE.read_text())
-    return []
-
-
-def save_example_captions(captions: list[str]):
-    EXAMPLE_CAPTIONS_FILE.write_text(json.dumps(captions, ensure_ascii=False, indent=2))
-
-
-# Initialise with the examples we have so far
-if not EXAMPLE_CAPTIONS_FILE.exists():
-    save_example_captions(
-        [
-            "Literally dead….. One of my favs i've ever listed!!! 💋 Gorgeous white embroidered floral jeans… SOOO baggy & flared!! Perfect mid-waisted length🤍🤍🤍 Such an it girl pair of jeans… might disappear 😝😝\n34.5cm waist max, 44cm hips, 25cm rise, 27cm thigh, 97cm\nlength, 27cm flare\n\nSB: $3",
-            "This one's from glacier ⭐️⭐️⭐️ Gorgeous gorgeous details & touch of green paisleys on this… i luvvv 🧚‍♂️🧚\nFits XS-M; 37-57cm ptp, 57cm length\n\nSB: $3",
-            "Cato pink striped halter ☀️💖Such a summery top i love!!! Can be worn as a tube too 💞💞\nFits XS-M, 37-47cm ptp, 42cm from pit\n\nSB: $3",
-            "Such a flattering lace cami in the prettiest purple-grey colour! 💭💭 Love the horizontal lace detail\nat the bust ⭐️⭐️ Goes sooo well with your fav pair of jeans/shorts 🫶🫶\nFits XS-M; 38-48cm ptp, 57cm length\n\nSB: $3",
-            "Camel Road low-waisted flared jeans 🦋🦋 Love the pop of white on the brand patch & the subtle navy embroidery at the back pockets 🩵 This one's for my lowkey girlieesss🫶🫶\n36-39cm across, 44cm hips max, 20cm rise, 26-30cm thigh, 100cm length\n\nSB: $3",
-            "Gorgeous purple flowy chiffon cami 🫧🫧 Fits sooo pretty, i love the asymmetrical flowy bottom🤍🤍 Comes with a concealed side zip, bust is double lined💋💋\nFits XS-S, 37-40cm ptp, 66cm length\n\nSB: $3",
-            "literally the most gorgeous yellow floral cami evaaaa 🌼🌼⭐️ So so pretty, i'm obsessed with the yellow florals & lace straps! Bust is double-lined😋\nFits XS-M, 35-50cm ptp, 64cm length\n\nSB: $3",
-        ]
-    )
+DEFAULT_CAPTIONS = [
+    "Literally dead….. One of my favs i've ever listed!!! 💋 Gorgeous white embroidered floral jeans… SOOO baggy & flared!! Perfect mid-waisted length🤍🤍🤍 Such an it girl pair of jeans… might disappear 😝😝\n34.5cm waist max, 44cm hips, 25cm rise, 27cm thigh, 97cm\nlength, 27cm flare\n\nSB: $3",
+    "This one's from glacier ⭐️⭐️⭐️ Gorgeous gorgeous details & touch of green paisleys on this… i luvvv 🧚‍♂️🧚\nFits XS-M; 37-57cm ptp, 57cm length\n\nSB: $3",
+    "Cato pink striped halter ☀️💖Such a summery top i love!!! Can be worn as a tube too 💞💞\nFits XS-M, 37-47cm ptp, 42cm from pit\n\nSB: $3",
+    "Such a flattering lace cami in the prettiest purple-grey colour! 💭💭 Love the horizontal lace detail\nat the bust ⭐️⭐️ Goes sooo well with your fav pair of jeans/shorts 🫶🫶\nFits XS-M; 38-48cm ptp, 57cm length\n\nSB: $3",
+    "Camel Road low-waisted flared jeans 🦋🦋 Love the pop of white on the brand patch & the subtle navy embroidery at the back pockets 🩵 This one's for my lowkey girlieesss🫶🫶\n36-39cm across, 44cm hips max, 20cm rise, 26-30cm thigh, 100cm length\n\nSB: $3",
+    "Gorgeous purple flowy chiffon cami 🫧🫧 Fits sooo pretty, i love the asymmetrical flowy bottom🤍🤍 Comes with a concealed side zip, bust is double lined💋💋\nFits XS-S, 37-40cm ptp, 66cm length\n\nSB: $3",
+    "literally the most gorgeous yellow floral cami evaaaa 🌼🌼⭐️ So so pretty, i'm obsessed with the yellow florals & lace straps! Bust is double-lined😋\nFits XS-M, 35-50cm ptp, 64cm length\n\nSB: $3",
+]
 
 # --- Groq client ---
 groq_client = Groq(api_key=GROQ_API_KEY)
 GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-# --- Database (for delete tracker) ---
+# --- Database ---
 DB_URL = os.getenv("DB_URL")
 engine = create_engine(DB_URL) if DB_URL else None
+
+
+def _init_captions_table():
+    """Create the example_captions table and seed defaults if empty."""
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(sql_text("""
+            CREATE TABLE IF NOT EXISTS example_captions (
+                id SERIAL PRIMARY KEY,
+                caption TEXT NOT NULL
+            )
+        """))
+        count = conn.execute(sql_text("SELECT COUNT(*) FROM example_captions")).scalar()
+        if count == 0:
+            for cap in DEFAULT_CAPTIONS:
+                conn.execute(sql_text("INSERT INTO example_captions (caption) VALUES (:cap)"), {"cap": cap})
+            logger.info(f"Seeded {len(DEFAULT_CAPTIONS)} default captions into DB")
+
+
+_init_captions_table()
+
+
+def load_example_captions() -> list[str]:
+    if engine is None:
+        return list(DEFAULT_CAPTIONS)
+    with engine.connect() as conn:
+        rows = conn.execute(sql_text("SELECT caption FROM example_captions ORDER BY id")).fetchall()
+    return [row.caption for row in rows]
+
+
+def save_example_captions(captions: list[str]):
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(sql_text("DELETE FROM example_captions"))
+        for cap in captions:
+            conn.execute(sql_text("INSERT INTO example_captions (caption) VALUES (:cap)"), {"cap": cap})
 
 # --- Conversation states ---
 BATCH_COLLECTING, WAITING_DELETE_ID = range(2)
@@ -102,8 +122,8 @@ Rules:
 - Keep it short (1-3 sentences max).
 - Use relevant emojis liberally, matching the vibe of the examples.
 - Do NOT add hashtags unless the examples use them.
-- Always include measurements or sizing if given in the descripton.
-- End with a price line in the format "SB: $X" (X is a whole number). If no price is given in the description, default to $3. There must be an empty line before the "SB:" line.
+- Always include measurements or sizing if given in the description. Place them on a new line right after the description text.
+- End with a price line in the format "SB: $X" (X is a whole number). If no price is given in the description, default to $3. There must be two empty lines between the measurements/description and the "SB:" line.
 - Output ONLY the caption text, nothing else."""
 
 
