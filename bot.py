@@ -11,9 +11,10 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from groq import Groq
-from telegram import Update, InputMediaPhoto
+from telegram import Update, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
@@ -25,7 +26,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pytz import timezone
 
 # Delay (seconds) to wait for all photos in a media group to arrive
-MEDIA_GROUP_WAIT = 1.5
+MEDIA_GROUP_WAIT = 3.0
 TIME_TO_CLEAR_DB = 12  # Time to clear the database (12 PM SGT)
 
 load_dotenv()
@@ -76,7 +77,7 @@ DB_URL = os.getenv("DB_URL")
 engine = create_engine(DB_URL) if DB_URL else None
 
 # --- Conversation states ---
-BATCH_COLLECTING = 0
+BATCH_COLLECTING, WAITING_DELETE_ID = range(2)
 
 
 def build_prompt(example_captions: list[str], description: str | None = None) -> str:
@@ -101,7 +102,7 @@ Rules:
 - Keep it short (1-3 sentences max).
 - Use relevant emojis liberally, matching the vibe of the examples.
 - Do NOT add hashtags unless the examples use them.
-- Do NOT include measurements or sizing unless given in the description.
+- Always include measurements or sizing if given in the descripton.
 - End with a price line in the format "SB: $X" (X is a whole number). If no price is given in the description, default to $3. There must be an empty line before the "SB:" line.
 - Output ONLY the caption text, nothing else."""
 
@@ -140,7 +141,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/batch - Batch mode (send multiple items, then /done)\n"
             "/addcaption <text> - Add an example caption\n"
             "/listcaptions - List saved example captions\n"
-            "/cancel - Cancel current batch"
+            "/deletecaption - Delete an example caption\n"
+            "/cancel - Cancel current operation"
         )
         context.user_data.clear()
 
@@ -159,7 +161,7 @@ async def _finalize_single_item(context: ContextTypes.DEFAULT_TYPE, chat_id: int
 
     await context.bot.send_message(chat_id=chat_id, text="✨ Generating your caption...")
     example_captions = load_example_captions()
-    await generate_and_send(chat_id, context.bot, photos, example_captions, description)
+    await generate_and_send(chat_id, context.bot, photos, example_captions, description, context)
 
 
 async def photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,12 +196,13 @@ async def photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         description = context.user_data.pop("description", None)
         await update.message.reply_text("✨ Generating your caption...")
         example_captions = load_example_captions()
-        await generate_and_send(update.effective_chat.id, context.bot, photos, example_captions, description)
+        await generate_and_send(update.effective_chat.id, context.bot, photos, example_captions, description, context)
 
 
 async def generate_and_send(chat_id: int, bot, photos: list[bytes],
                            example_captions: list[str],
-                           description: str | None = None) -> str | None:
+                           description: str | None = None,
+                           context: ContextTypes.DEFAULT_TYPE | None = None) -> str | None:
     """Generate a caption for photos and send them back as a forwardable media group.
     Returns the caption on success, or None on failure."""
     prompt = build_prompt(example_captions, description)
@@ -236,7 +239,35 @@ async def generate_and_send(chat_id: int, bot, photos: list[bytes],
         else:
             media.append(InputMediaPhoto(media=buf))
     await bot.send_media_group(chat_id=chat_id, media=media)
+
+    # Send a "Regenerate" button and store photos/description for reuse
+    if context is not None:
+        context.user_data["last_photos"] = photos
+        context.user_data["last_description"] = description
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Regenerate", callback_data="regenerate")]
+        ])
+        await bot.send_message(chat_id=chat_id, text="Not happy? Tap to regenerate.", reply_markup=keyboard)
+
     return caption
+
+
+async def regenerate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the Regenerate button press."""
+    query = update.callback_query
+    await query.answer()
+
+    photos = context.user_data.get("last_photos")
+    description = context.user_data.get("last_description")
+
+    if not photos:
+        await query.edit_message_text("No photos to regenerate from. Send a new album!")
+        return
+
+    await query.edit_message_text("🔄 Regenerating...")
+    example_captions = load_example_captions()
+    await generate_and_send(update.effective_chat.id, context.bot, photos,
+                           example_captions, description, context)
 
 
 # =====================================================================
@@ -328,7 +359,7 @@ async def batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, item in enumerate(items):
         await update.message.reply_text(f"✨ Processing item {i + 1}/{total}...")
         await generate_and_send(update.effective_chat.id, context.bot,
-                                item["photos"], example_captions, item["description"])
+                                item["photos"], example_captions, item["description"], context)
 
     await update.message.reply_text(f"✅ All {total} items done!")
     context.user_data.clear()
@@ -361,6 +392,39 @@ async def list_captions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"{i+1}) {c}" for i, c in enumerate(captions)]
     await update.message.reply_text("📋 Example captions:\n\n" + "\n\n".join(lines))
+
+
+async def delete_caption_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    captions = load_example_captions()
+    if not captions:
+        await update.message.reply_text("No example captions to delete.")
+        return ConversationHandler.END
+    lines = [f"{i+1}) {c}" for i, c in enumerate(captions)]
+    await update.message.reply_text(
+        "📋 Example captions:\n\n" + "\n\n".join(lines)
+        + "\n\nReply with the number of the caption to delete, or /cancel to abort."
+    )
+    return WAITING_DELETE_ID
+
+
+async def delete_caption_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    captions = load_example_captions()
+    try:
+        idx = int(update.message.text.strip()) - 1
+        if idx < 0 or idx >= len(captions):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(f"Please enter a number between 1 and {len(captions)}, or /cancel.")
+        return WAITING_DELETE_ID
+
+    removed = captions.pop(idx)
+    save_example_captions(captions)
+    preview = removed[:80] + "..." if len(removed) > 80 else removed
+    await update.message.reply_text(
+        f"🗑️ Deleted caption #{idx + 1}: {preview}\n\n"
+        f"You now have {len(captions)} example caption{'s' if len(captions) != 1 else ''}."
+    )
+    return ConversationHandler.END
 
 
 # =====================================================================
@@ -527,7 +591,20 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("addcaption", add_caption))
     app.add_handler(CommandHandler("listcaptions", list_captions))
+
+    # Delete caption conversation
+    delete_conv = ConversationHandler(
+        entry_points=[CommandHandler("deletecaption", delete_caption_start)],
+        states={
+            WAITING_DELETE_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, delete_caption_confirm),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(delete_conv)
     app.add_handler(CommandHandler("deleted", show_deleted))
+    app.add_handler(CallbackQueryHandler(regenerate_callback, pattern="^regenerate$"))
 
     # Batch mode conversation (private chats only)
     batch_conv = ConversationHandler(
